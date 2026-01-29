@@ -1,73 +1,114 @@
-# React + TypeScript + Vite
+# Audio Transcription Flow: ReadToMePage → AnalysisPage
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+## Complete Flow Overview
 
-Currently, two official plugins are available:
+### Phase 1: Model Initialization (ReadToMePage)
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+1. **User clicks record button** → `handleRecordClick()` is triggered
+2. **Model check**: `checkIfModelDownloaded()` loads the Whisper model (`Xenova/whisper-tiny.en`) using Hugging Face Transformers
+3. **Progress UI**: Shows loading indicator while model downloads/loads
+4. **Ready state**: `isModelReady` becomes `true`
 
-## React Compiler
+### Phase 2: Audio Capture Pipeline
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+When the user clicks record again (after model is ready):
 
-## Expanding the ESLint configuration
+1. **`startRecording()` executes**:
+   - Requests microphone access via `getUserMedia()` (16kHz, mono)
+   - Creates an `AudioContext` (16kHz sample rate)
+   - Loads the AudioWorklet processor module (`audio-processor.worklet.js`)
+   - Creates a Web Worker for transcription (`whisper.worker.js`)
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+2. **AudioWorklet Processor** (`audio-processor.worklet.js`):
+   - Runs in a separate audio thread
+   - Receives audio samples in real-time (128 samples per render quantum)
+   - Accumulates samples into 4096-sample buffers
+   - Sends each 4096-sample buffer to the main thread via `port.postMessage()`
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+3. **Main Thread Processing** (ReadToMePage):
+   - Receives 4096-sample chunks from the AudioWorklet
+   - Accumulates 4 chunks (~1 second of audio: 4 × 4096 / 16000 Hz ≈ 1.024s)
+   - Combines them into a single `Float32Array`
+   - Sends the combined audio to the Whisper worker via `worker.postMessage()`
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+### Phase 3: Transcription (whisper.worker.js)
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+1. **Worker receives audio data**
+2. **Lazy model loading**: Loads the Whisper model on first use (cached afterward)
+3. **Transcription**: Runs Whisper on the audio chunk
+4. **Result**: Sends `{ status: 'complete', text: '...' }` back to the main thread
+
+### Phase 4: Transcript Accumulation
+
+1. **Main thread receives transcription results** via `worker.onmessage`
+2. **Accumulation**: Each text chunk is pushed to `transcriptChunksRef.current`
+3. **Real-time updates**: Transcript chunks accumulate as recording continues
+
+### Phase 5: Stop Recording and Navigation
+
+When the user clicks stop:
+
+1. **`stopRecording()` executes**:
+   - Disconnects audio nodes and stops the microphone stream
+   - Terminates the worker
+   - Combines all transcript chunks: `transcriptChunksRef.current.join(' ')`
+   - Stores in context: `setTranscript(fullTranscript)` (TranscriptContext)
+   - Navigates: `navigate('/analysis')`
+
+### Phase 6: Display on AnalysisPage
+
+1. **AnalysisPage mounts** and calls `useTranscript()`
+2. **Reads transcript**: `const { transcript } = useTranscript()` (from TranscriptContext)
+3. **Renders**: Displays the transcript text in a `<Typography>` component
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    ReadToMePage (Main Thread)                 │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  AudioWorklet (Audio Thread)                          │   │
+│  │  • Captures 4096-sample chunks                       │   │
+│  │  • Sends to main thread                               │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                          ↓                                    │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  Main Thread Processing                              │   │
+│  │  • Accumulates 4 chunks (~1 second)                 │   │
+│  │  • Sends to Worker                                    │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                          ↓                                    │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  Whisper Worker (Separate Thread)                     │   │
+│  │  • Loads Whisper model                                │   │
+│  │  • Transcribes audio → text                           │   │
+│  │  • Sends text back                                    │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                          ↓                                    │
+│  • Accumulates transcript chunks                            │
+│  • On stop: combines & stores in TranscriptContext         │
+│  • Navigates to /analysis                                   │
+└─────────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│                    AnalysisPage                              │
+│  • Reads from TranscriptContext                              │
+│  • Renders transcript text                                   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Key Concepts
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+1. **Three Threads**:
+   - **Audio thread** (AudioWorklet): Real-time audio capture
+   - **Main thread**: UI and coordination
+   - **Worker thread**: ML model inference
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+2. **Batching**: Accumulates ~1 second of audio before sending to reduce overhead
+
+3. **State Management**: TranscriptContext holds the final transcript across navigation
+
+4. **Real-time vs. Final**: Chunks accumulate during recording; full transcript is stored on stop
+
+This architecture keeps the UI responsive while processing audio and running the model in the background.
+

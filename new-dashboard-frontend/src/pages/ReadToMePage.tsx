@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Box, Typography, IconButton, CircularProgress } from '@mui/material';
-import { CheckCircle, HighlightOffRounded, Mic, RecordVoiceOver, StopCircle } from '@mui/icons-material';
+import { CheckCircle, HighlightOffRounded, Mic, StopCircle } from '@mui/icons-material';
 import { pipeline } from '@huggingface/transformers';
 import { useTranscript } from '../context/TranscriptContext';
 
@@ -63,12 +63,12 @@ function ReadToMePage() {
   const [isModelReady, setIsModelReady] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
   const workerRef = useRef<Worker | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
   const transcriptChunksRef = useRef<string[]>([]);
+  const audioBufferRef = useRef<Float32Array[]>([]);
 
   useEffect(() => {
     return () => {
@@ -80,8 +80,10 @@ function ReadToMePage() {
   }, []);
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
+    if (audioWorkletNodeRef.current) {
+      audioWorkletNodeRef.current.disconnect();
+      audioWorkletNodeRef.current.port.close();
+      audioWorkletNodeRef.current = null;
     }
     
     if (audioStreamRef.current) {
@@ -108,7 +110,7 @@ function ReadToMePage() {
     }
 
     setIsRecording(false);
-    audioChunksRef.current = [];
+    audioBufferRef.current = [];
     transcriptChunksRef.current = [];
   };
 
@@ -116,13 +118,21 @@ function ReadToMePage() {
     // Clear previous transcript when starting new recording
     clearTranscript();
     transcriptChunksRef.current = [];
+    audioBufferRef.current = [];
     
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          sampleRate: 16000, // Whisper expects 16kHz
+          channelCount: 1, // Mono
+          echoCancellation: true,
+          noiseSuppression: true,
+        }
+      });
       audioStreamRef.current = stream;
 
-      // Create AudioContext for audio processing
-      const audioContext = new AudioContext();
+      // Create AudioContext with 16kHz sample rate (Whisper's expected rate)
+      const audioContext = new AudioContext({ sampleRate: 16000 });
       audioContextRef.current = audioContext;
 
       const worker = new Worker(new URL('../workers/whisper.worker.js', import.meta.url), {
@@ -143,50 +153,56 @@ function ReadToMePage() {
         console.error('Worker error:', error);
       };
 
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm',
-      });
-      mediaRecorderRef.current = mediaRecorder;
+      // Load the AudioWorklet processor
+      await audioContext.audioWorklet.addModule(
+        new URL('../workers/audio-processor.worklet.js', import.meta.url)
+      );
 
-      mediaRecorder.ondataavailable = async (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
+      // Create a source node from the stream
+      const source = audioContext.createMediaStreamSource(stream);
+      
+      // Create AudioWorkletNode to capture audio samples (modern replacement for ScriptProcessorNode)
+      const audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+      audioWorkletNodeRef.current = audioWorkletNode;
+
+      // Create a silent gain node to avoid audio feedback
+      const silentGain = audioContext.createGain();
+      silentGain.gain.value = 0;
+
+      // Process audio chunks from the worklet
+      audioWorkletNode.port.onmessage = (event) => {
+        if (event.data.type === 'audioData') {
+          const audioData = event.data.data;
           
-          // Convert blob to AudioBuffer, then to Float32Array for worker
-          try {
-            const arrayBuffer = await event.data.arrayBuffer();
-            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-            
-            // Convert to mono Float32Array (whisper expects mono audio)
-            const leftChannel = audioBuffer.getChannelData(0);
-            const rightChannel = audioBuffer.numberOfChannels > 1 
-              ? audioBuffer.getChannelData(1) 
-              : null;
-            
-            let monoAudio: Float32Array;
-            if (rightChannel) {
-              // Mix stereo to mono
-              monoAudio = new Float32Array(leftChannel.length);
-              for (let i = 0; i < leftChannel.length; i++) {
-                monoAudio[i] = (leftChannel[i] + rightChannel[i]) / 2;
-              }
-            } else {
-              monoAudio = leftChannel;
+          // Accumulate audio buffers for potential batch processing
+          audioBufferRef.current.push(audioData);
+          
+          // Send audio chunk to worker for transcription
+          // We'll send chunks periodically to avoid overwhelming the worker
+          if (audioBufferRef.current.length >= 4) { // Send every ~1 second (4 chunks * 4096 samples / 16000 Hz ≈ 1.024s)
+            const combinedAudio = new Float32Array(
+              audioBufferRef.current.reduce((acc, chunk) => acc + chunk.length, 0)
+            );
+            let offset = 0;
+            for (const chunk of audioBufferRef.current) {
+              combinedAudio.set(chunk, offset);
+              offset += chunk.length;
             }
             
-            worker.postMessage({ audio: monoAudio });
-          } catch (error) {
-            console.error('Error processing audio:', error);
+            worker.postMessage({ audio: combinedAudio });
+            audioBufferRef.current = [];
           }
         }
       };
 
-      mediaRecorder.onstop = () => {
-        console.log('Recording stopped');
-      };
+      // Connect the audio nodes
+      // Source -> AudioWorkletNode -> SilentGain -> Destination (silent)
+      source.connect(audioWorkletNode);
+      audioWorkletNode.connect(silentGain);
+      silentGain.connect(audioContext.destination);
 
-      mediaRecorder.start(1000);
       setIsRecording(true);
+      console.log('Recording started with AudioWorklet');
     } catch (error) {
       console.error('Error starting recording:', error);
       alert('Could not access microphone. Please check your browser permissions.');
